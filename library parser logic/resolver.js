@@ -382,112 +382,325 @@ class UniversalResolver {
         return versions.sort((a, b) => this.compareVersions(a, b));
     }
 
-    // Search Query Version Protocol - Adjusts versions based on algo response
+    // Search Query Version Protocol - Finds best version with accuracy rating
     async searchQueryVersionProtocol(req, maxAttempts = 10) {
         const targetVersion = req.version;
         let availableVersions = await this.fetchAvailableVersions(req);
         
-        // Sort oldest to newest
-        availableVersions = this.sortVersionsOldestToNewest(availableVersions);
-        
-        let bestVersion = null;
-        let bestScore = 0;
-        let attempt = 0;
-        
-        while (attempt < maxAttempts && availableVersions.length > 0) {
-            attempt++;
-            
-            // Try each version from oldest to newest
-            for (const version of availableVersions) {
-                const pkg = {
-                    name: req.name,
-                    version: version,
-                    language: req.language,
-                    source: req.source,
-                    gf: this.calculateGF(req, version),
-                    h: this.calculateH(req, version)
-                };
-                
-                // Test compatibility score
-                const score = this.calculateCompatibilityScore(pkg, attempt);
-                
-                // If version matches target closely or has good score
-                if (version === targetVersion || score >= 0.95) {
-                    return {
-                        version: version,
-                        score: score,
-                        adjusted: version !== targetVersion,
-                        originalTarget: targetVersion,
-                        attempts: attempt
-                    };
-                }
-                
-                // Track best alternative
-                if (score > bestScore) {
-                    bestScore = score;
-                    bestVersion = version;
-                }
-            }
-            
-            // If exact match not found, adjust and re-query
-            if (bestVersion && bestScore >= 0.7) {
-                // Remove incompatible versions and re-query
-                availableVersions = availableVersions.filter(v => {
-                    const testPkg = { name: req.name, version: v, gf: 50, h: 0.5 };
-                    return this.calculateCompatibilityScore(testPkg, attempt) >= 0.5;
-                });
-                
-                if (availableVersions.length === 0) {
-                    // Re-fetch with adjusted parameters
-                    availableVersions = await this.fetchAdjustedVersions(req, attempt);
-                }
-            }
-        }
-        
-        // Return best available if no perfect match
-        if (bestVersion) {
+        if (availableVersions.length === 0) {
             return {
-                version: bestVersion,
-                score: bestScore,
-                adjusted: true,
-                originalTarget: targetVersion,
-                attempts: attempt,
-                note: 'Version adjusted due to mismatch or unavailability'
+                version: targetVersion || 'latest',
+                score: 0,
+                adjusted: false,
+                error: 'No versions available from registry',
+                attempts: 0,
+                accuracyRating: 'failed'
             };
         }
         
+        // Sort newest to oldest for better matching
+        availableVersions = availableVersions.sort((a, b) => this.compareVersions(b, a));
+        
+        // Handle blank/undefined versions - pick latest stable
+        if (!targetVersion || targetVersion === 'latest' || targetVersion === '*') {
+            const latest = availableVersions[0];
+            const accuracy = this.calculateAccuracyRating(null, latest, availableVersions);
+            return {
+                version: latest,
+                score: 1.0,
+                adjusted: true,
+                originalTarget: 'blank/latest',
+                attempts: 1,
+                accuracyRating: accuracy.rating,
+                accuracyDetails: accuracy.details,
+                note: 'Auto-selected latest stable version'
+            };
+        }
+        
+        // Try exact match first
+        const exactMatch = availableVersions.find(v => v === targetVersion.replace(/^[\^~>=<]+/, ''));
+        if (exactMatch) {
+            const accuracy = this.calculateAccuracyRating(targetVersion, exactMatch, availableVersions);
+            return {
+                version: exactMatch,
+                score: 1.0,
+                adjusted: false,
+                originalTarget: targetVersion,
+                attempts: 1,
+                accuracyRating: accuracy.rating,
+                accuracyDetails: accuracy.details,
+                note: 'Exact match found'
+            };
+        }
+        
+        // Try semver range matching (^18.3.1 should match 18.3.1, 18.4.0, etc.)
+        const rangeMatch = this.findBestSemverMatch(targetVersion, availableVersions);
+        if (rangeMatch) {
+            const accuracy = this.calculateAccuracyRating(targetVersion, rangeMatch, availableVersions);
+            return {
+                version: rangeMatch,
+                score: accuracy.score,
+                adjusted: true,
+                originalTarget: targetVersion,
+                attempts: 1,
+                accuracyRating: accuracy.rating,
+                accuracyDetails: accuracy.details,
+                note: `Semver range match for ${targetVersion}`
+            };
+        }
+        
+        // Fallback: use best available with scoring
+        let bestVersion = availableVersions[0]; // Latest
+        let bestScore = 0;
+        
+        for (const version of availableVersions.slice(0, 20)) { // Check top 20
+            const score = this.calculateVersionAccuracyScore(targetVersion, version);
+            if (score > bestScore) {
+                bestScore = score;
+                bestVersion = version;
+            }
+        }
+        
+        const accuracy = this.calculateAccuracyRating(targetVersion, bestVersion, availableVersions);
         return {
-            version: targetVersion,
-            score: 0,
-            adjusted: false,
-            error: 'No available version found',
-            attempts: attempt
+            version: bestVersion,
+            score: bestScore,
+            adjusted: true,
+            originalTarget: targetVersion,
+            attempts: 1,
+            accuracyRating: accuracy.rating,
+            accuracyDetails: accuracy.details,
+            note: 'Best available version selected'
         };
     }
 
-    // Fetch available versions from registry (simulated - would query npm/pypi/etc)
-    async fetchAvailableVersions(req) {
-        // In real implementation, this would query:
-        // npm view <pkg> versions --json
-        // pip index versions <pkg>
-        // cargo search <pkg>
-        // go list -m -versions <pkg>
+    // Find best semver match (^, ~, >=, etc.)
+    findBestSemverMatch(range, versions) {
+        // Parse range
+        const cleanRange = range.trim();
         
-        const baseVersions = [
-            '0.9.0', '0.9.5', '1.0.0-alpha', '1.0.0-beta', 
-            '1.0.0-rc', '1.0.0', '1.0.1', '1.1.0', '1.1.1', 
-            '1.2.0', '2.0.0-alpha', '2.0.0-beta', '2.0.0', '2.1.0'
-        ];
-        
-        // Add requested version if not in list
-        let target = req.version || '1.0.0';
-        target = target.replace(/^[\^~>=<]+/, '');
-        
-        if (!baseVersions.includes(target)) {
-            baseVersions.push(target);
+        // ^18.3.1 -> compatible with 18.3.1, 18.4.0, 18.x.x but NOT 19.0.0
+        if (cleanRange.startsWith('^')) {
+            const base = cleanRange.substring(1);
+            const [major, minor, patch] = base.split('.').map(v => parseInt(v) || 0);
+            
+            // Find highest version within same major
+            const matches = versions.filter(v => {
+                const [vMaj, vMin, vPat] = v.split('.').map(x => parseInt(x) || 0);
+                if (vMaj !== major) return false;
+                if (vMin < minor) return false;
+                if (vMin === minor && vPat < patch) return false;
+                return true;
+            });
+            
+            return matches[0] || null; // Return highest (newest)
         }
         
-        return baseVersions;
+        // ~18.3.1 -> compatible with 18.3.x but NOT 18.4.0
+        if (cleanRange.startsWith('~')) {
+            const base = cleanRange.substring(1);
+            const [major, minor] = base.split('.').map(v => parseInt(v) || 0);
+            
+            const matches = versions.filter(v => {
+                const [vMaj, vMin] = v.split('.').map(x => parseInt(x) || 0);
+                return vMaj === major && vMin === minor;
+            });
+            
+            return matches[0] || null;
+        }
+        
+        // >=18.3.1
+        if (cleanRange.startsWith('>=')) {
+            const base = cleanRange.substring(2);
+            const baseParts = base.split('.').map(v => parseInt(v) || 0);
+            
+            const matches = versions.filter(v => {
+                const vParts = v.split('.').map(x => parseInt(x) || 0);
+                for (let i = 0; i < 3; i++) {
+                    if (vParts[i] > baseParts[i]) return true;
+                    if (vParts[i] < baseParts[i]) return false;
+                }
+                return true;
+            });
+            
+            return matches[0] || null;
+        }
+        
+        // 18.3.1 (exact with no prefix)
+        if (/^\d+\.\d+/.test(cleanRange)) {
+            const base = cleanRange.replace(/^[\^~>=<]+/, '');
+            return versions.find(v => v.startsWith(base)) || null;
+        }
+        
+        return null;
+    }
+
+    // Calculate accuracy score (0-1) based on how well version matches target
+    calculateVersionAccuracyScore(target, candidate) {
+        const targetParts = target.replace(/^[\^~>=<]+/, '').split('.').map(v => parseInt(v) || 0);
+        const candParts = candidate.split('.').map(v => parseInt(v) || 0);
+        
+        let score = 0;
+        const weights = [0.5, 0.3, 0.2]; // major, minor, patch weights
+        
+        for (let i = 0; i < 3; i++) {
+            const t = targetParts[i] || 0;
+            const c = candParts[i] || 0;
+            if (c === t) score += weights[i];
+            else if (c > t) score += weights[i] * 0.5; // higher version partial credit
+        }
+        
+        return score;
+    }
+
+    // Calculate accuracy rating (A-F) with details
+    calculateAccuracyRating(target, selected, allVersions) {
+        if (!target || target === 'latest' || target === '*') {
+            return {
+                rating: 'A',
+                score: 1.0,
+                details: {
+                    type: 'auto_latest',
+                    matchType: 'latest_stable',
+                    totalAvailable: allVersions.length,
+                    percentile: 100
+                }
+            };
+        }
+        
+        const cleanTarget = target.replace(/^[\^~>=<]+/, '');
+        const [tMaj, tMin, tPat] = cleanTarget.split('.').map(v => parseInt(v) || 0);
+        const [sMaj, sMin, sPat] = selected.split('.').map(v => parseInt(v) || 0);
+        
+        // Determine match type
+        let matchType = 'partial';
+        let rating = 'C';
+        let score = 0.5;
+        
+        if (sMaj === tMaj && sMin === tMin && sPat === tPat) {
+            matchType = 'exact';
+            rating = 'A+';
+            score = 1.0;
+        } else if (sMaj === tMaj && sMin === tMin) {
+            matchType = 'same_minor';
+            rating = 'A';
+            score = 0.9;
+        } else if (sMaj === tMaj) {
+            matchType = 'same_major';
+            rating = 'B';
+            score = 0.75;
+        } else if (sMaj === tMaj + 1) {
+            matchType = 'next_major';
+            rating = 'C';
+            score = 0.5;
+        }
+        
+        // Calculate percentile (how high is this version among all available)
+        const sorted = [...allVersions].sort((a, b) => this.compareVersions(b, a));
+        const rank = sorted.indexOf(selected);
+        const percentile = Math.round(((allVersions.length - rank) / allVersions.length) * 100);
+        
+        return {
+            rating,
+            score,
+            details: {
+                type: matchType,
+                targetVersion: cleanTarget,
+                selectedVersion: selected,
+                majorMatch: sMaj === tMaj,
+                minorMatch: sMin === tMin,
+                patchMatch: sPat === tPat,
+                totalAvailable: allVersions.length,
+                rank: rank + 1,
+                percentile
+            }
+        };
+    }
+
+    // Fetch available versions from actual registry
+    async fetchAvailableVersions(req) {
+        const { execSync } = require('child_process');
+        const name = req.name;
+        const language = req.language || 'node';
+        
+        try {
+            if (language === 'node' || language === 'npm') {
+                // Query npm registry
+                const result = execSync(`npm view ${name} versions --json 2>/dev/null`, { 
+                    encoding: 'utf8', 
+                    timeout: 15000,
+                    maxBuffer: 5 * 1024 * 1024
+                });
+                const versions = JSON.parse(result);
+                if (Array.isArray(versions) && versions.length > 0) {
+                    return versions.filter(v => /^\d+\.\d+\.\d+/.test(v)); // Only stable versions
+                }
+            } 
+            else if (language === 'python' || language === 'pip') {
+                // Query PyPI via pip
+                const result = execSync(`pip index versions ${name} 2>&1 | head -5`, {
+                    encoding: 'utf8',
+                    timeout: 15000
+                });
+                // Parse output like: "Available versions: 1.0.0, 1.0.1, 1.1.0"
+                const match = result.match(/Available versions?:\s*([\d.,\s]+)/i);
+                if (match) {
+                    return match[1].split(',').map(v => v.trim()).filter(v => v);
+                }
+            }
+            else if (language === 'rust' || language === 'cargo') {
+                // For cargo, we use crates.io API or cargo search
+                const result = execSync(`cargo search ${name} --limit 1 2>/dev/null | head -1`, {
+                    encoding: 'utf8',
+                    timeout: 15000
+                });
+                // Parse like: "crate = \"1.2.3\""
+                const match = result.match(/=\s*"(\d+\.\d+\.\d+)"/);
+                if (match) {
+                    const latest = match[1];
+                    const [major, minor] = latest.split('.').map(Number);
+                    // Generate recent versions
+                    const versions = [];
+                    for (let m = Math.max(0, minor - 5); m <= minor; m++) {
+                        for (let p = 0; p <= 10; p++) {
+                            versions.push(`${major}.${m}.${p}`);
+                        }
+                    }
+                    return versions;
+                }
+            }
+            else if (language === 'go') {
+                // Query Go proxy
+                const https = require('https');
+                const proxy = process.env.GOPROXY || 'https://proxy.golang.org';
+                const versions = await new Promise((resolve, reject) => {
+                    https.get(`${proxy}/${name}/@v/list`, (res) => {
+                        let data = '';
+                        res.on('data', chunk => data += chunk);
+                        res.on('end', () => {
+                            const vers = data.trim().split('\n')
+                                .filter(v => v.startsWith('v'))
+                                .map(v => v.replace(/^v/, ''));
+                            resolve(vers);
+                        });
+                    }).on('error', reject);
+                });
+                if (versions.length > 0) return versions;
+            }
+        } catch (e) {
+            console.log(`[Registry] Could not fetch versions for ${name}: ${e.message}`);
+        }
+        
+        // If registry fetch fails and we have a specific version requested, try to use it
+        if (req.version && req.version !== 'latest' && req.version !== '*') {
+            const cleanVersion = req.version.replace(/^[\^~>=<]+/, '');
+            if (cleanVersion.match(/^\d+\.\d+/)) {
+                return [cleanVersion];
+            }
+        }
+        
+        // Last resort - return empty and let caller handle
+        return [];
     }
 
     // Re-fetch with adjusted parameters based on algo response
